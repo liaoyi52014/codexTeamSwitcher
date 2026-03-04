@@ -1,17 +1,25 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 # Codex Team Switcher 启动脚本
 # 使用虚拟环境隔离依赖
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 虚拟环境目录
-VENV_DIR="$PROJECT_DIR/venv"
+VENV_DIR="${VENV_DIR:-$PROJECT_DIR/venv}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "错误: 未找到 Python 可执行文件: $PYTHON_BIN"
+    exit 1
+fi
 
 # 创建虚拟环境（如果不存在）
 if [ ! -d "$VENV_DIR" ]; then
-    echo "创建虚拟环境..."
-    python3 -m venv "$VENV_DIR"
+    echo "创建虚拟环境: $VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
 # 激活虚拟环境
@@ -19,8 +27,8 @@ source "$VENV_DIR/bin/activate"
 
 # 安装依赖
 echo "安装依赖..."
-pip install --upgrade pip -q
-pip install -r "$PROJECT_DIR/requirements.txt" -q
+python -m pip install --upgrade pip
+python -m pip install -r "$PROJECT_DIR/requirements.txt"
 
 # 检查配置文件
 if [ ! -f "$PROJECT_DIR/config.yaml" ]; then
@@ -37,4 +45,4 @@ echo "代理服务: http://localhost:18888"
 echo ""
 
 cd "$PROJECT_DIR"
-python3 src/main.py "$@"
+exec python src/main.py "$@"

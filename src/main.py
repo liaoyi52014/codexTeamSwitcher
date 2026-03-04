@@ -201,6 +201,8 @@ class CodexTeamSwitcher:
         from src.utils.codex_auth import load_codex_token
 
         existing_teams = {t.id: t for t in self._token_manager.get_all_teams()}
+        synced_count = 0
+        skipped_count = 0
 
         for team_config in self._config.teams:
             # Get access token - either from config or from Codex auth
@@ -212,6 +214,16 @@ class CodexTeamSwitcher:
                     self._logger.info("using_codex_auth_token", team_id=team_config.id)
                 else:
                     self._logger.warning("codex_auth_requested_but_not_available", team_id=team_config.id)
+
+            # Backward compatibility: skip placeholder teams from old templates.
+            if not team_config.use_codex_auth and access_token == "sk-your-token-here":
+                self._logger.warning(
+                    "skipping_placeholder_team_from_config",
+                    team_id=team_config.id,
+                    team_name=team_config.name,
+                )
+                skipped_count += 1
+                continue
 
             if team_config.id in existing_teams:
                 # Update existing team
@@ -227,6 +239,7 @@ class CodexTeamSwitcher:
                         access_token=access_token,
                         refresh_token=team_config.refresh_token or None,
                     )
+                synced_count += 1
             else:
                 # Add new team
                 from datetime import datetime
@@ -248,9 +261,15 @@ class CodexTeamSwitcher:
                     priority=team_config.priority,
                     status_command=team_config.status_command,
                 )
+                synced_count += 1
 
         self._db_session.commit()
-        self._logger.info("teams_synced", count=len(self._config.teams))
+        self._logger.info(
+            "teams_synced",
+            count=synced_count,
+            skipped=skipped_count,
+            configured=len(self._config.teams),
+        )
 
     def start_proxy(self, blocking: bool = True) -> None:
         """

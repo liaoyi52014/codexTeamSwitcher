@@ -16,37 +16,8 @@ database:
   db_path: "./data/teams.db"
 
 # Team configuration
-teams:
-  # Add your teams here
-  - id: "team-001"
-    name: "Team Alpha"
-    enabled: true
-    priority: 1
-    # Set to true to automatically load token from ~/.codex/auth.json
-    use_codex_auth: false
-    oauth:
-      # Access token (will be encrypted when stored)
-      # Only used if use_codex_auth is false
-      access_token: "sk-your-token-here"
-      # Refresh token (optional)
-      refresh_token: ""
-      # Token expiration time (ISO 8601 format)
-      expires_at: ""
-      # Organization ID (optional)
-      organization_id: ""
-    # Custom status command (optional, defaults to /status)
-    status_command: "/status"
-
-  - id: "team-002"
-    name: "Team Beta"
-    enabled: true
-    priority: 2
-    use_codex_auth: false
-    oauth:
-      access_token: "sk-your-token-here"
-      refresh_token: ""
-      expires_at: ""
-      organization_id: ""
+# 留空时，系统首次启动会自动从 ~/.codex/auth.json 导入当前登录账户
+teams: []
 
 # Monitor settings
 monitor:

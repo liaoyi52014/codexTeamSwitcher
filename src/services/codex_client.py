@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -25,6 +25,10 @@ class UsageInfo:
     usage_5h_percent: float = 0.0
     # Weekly usage (secondary)
     usage_weekly_percent: float = 0.0
+    # Refresh time for 5-hour window (UTC)
+    refresh_at_5h: Optional[datetime] = None
+    # Refresh time for weekly window (UTC)
+    refresh_at_weekly: Optional[datetime] = None
 
 
 class StatusCommandError(Exception):
@@ -209,7 +213,13 @@ class CodexClient:
         except Exception as e:
             raise StatusCommandError(f"Failed to execute command: {e}")
 
-    def get_usage(self, api_key: str, timeout: int = 30, team_id: str = None) -> UsageInfo:
+    def get_usage(
+        self,
+        api_key: str,
+        timeout: int = 30,
+        team_id: str = None,
+        account_id: str = None,
+    ) -> UsageInfo:
         """
         Get team usage information via OpenAI API.
 
@@ -219,6 +229,7 @@ class CodexClient:
             api_key: API key for authentication.
             timeout: Request timeout in seconds.
             team_id: Team ID for mock usage lookup.
+            account_id: Optional ChatGPT account id override.
 
         Returns:
             UsageInfo object with quota details.
@@ -259,9 +270,10 @@ class CodexClient:
                 "Accept": "application/json",
             }
 
-            # Get account_id from Codex auth
-            from src.utils.codex_auth import get_codex_account_id
-            account_id = get_codex_account_id()
+            # Get account_id from caller (preferred) or active Codex auth.
+            if not account_id:
+                from src.utils.codex_auth import get_codex_account_id
+                account_id = get_codex_account_id()
 
             if not account_id:
                 self._logger.warning("no_account_id_found")
@@ -400,18 +412,17 @@ class CodexClient:
 
             # Get used_percent from windows
             # Primary window is typically 5 hours, secondary is 1 week
-            used_percent_5h = primary_window.get("used_percent", 0) or 0
-            used_percent_weekly = secondary_window.get("used_percent", 0) or 0
-
-            # Handle unlimited or error cases
-            if used_percent_5h is None:
-                used_percent_5h = 0
-            if used_percent_weekly is None:
-                used_percent_weekly = 0
+            used_percent_5h = self._parse_percent_value(primary_window.get("used_percent"))
+            used_percent_weekly = self._parse_percent_value(
+                secondary_window.get("used_percent")
+            )
+            refresh_at_5h = self._extract_window_refresh_at(primary_window)
+            refresh_at_weekly = self._extract_window_refresh_at(secondary_window)
 
             # Calculate remaining percentage (100 - used)
             # Use 5h as the primary percentage for the main display
-            percentage = max(0, 100 - used_percent_5h)
+            percentage = max(0.0, min(100.0, 100.0 - used_percent_5h))
+            weekly_percentage = max(0.0, min(100.0, 100.0 - used_percent_weekly))
 
             # For total/remaining, we use a default scale since we don't have absolute values
             total = 100000  # Default quota units
@@ -425,6 +436,8 @@ class CodexClient:
                 used_percent_weekly=used_percent_weekly,
                 primary_window=primary_window.get("limit_window_seconds"),
                 secondary_window=secondary_window.get("limit_window_seconds"),
+                refresh_at_5h=refresh_at_5h.isoformat() if refresh_at_5h else None,
+                refresh_at_weekly=refresh_at_weekly.isoformat() if refresh_at_weekly else None,
             )
 
             return UsageInfo(
@@ -433,11 +446,125 @@ class CodexClient:
                 remaining=remaining,
                 percentage=percentage,
                 last_checked=datetime.utcnow(),
-                usage_5h_percent=100 - used_percent_5h,
-                usage_weekly_percent=100 - used_percent_weekly,
+                usage_5h_percent=percentage,
+                usage_weekly_percent=weekly_percentage,
+                refresh_at_5h=refresh_at_5h,
+                refresh_at_weekly=refresh_at_weekly,
             )
         except Exception as e:
             raise StatusCommandError(f"Failed to parse Codex usage: {e}")
+
+    @staticmethod
+    def _parse_percent_value(value: Any) -> float:
+        """
+        Parse percentage-like values into float.
+
+        Accepts numeric values and strings such as "34.5" or "34.5%".
+        """
+        if value is None:
+            return 0.0
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        if isinstance(value, str):
+            raw = value.strip()
+            if raw.endswith("%"):
+                raw = raw[:-1].strip()
+            if not raw:
+                return 0.0
+            try:
+                return float(raw)
+            except ValueError:
+                return 0.0
+
+        return 0.0
+
+    @staticmethod
+    def _parse_datetime_value(value: Any) -> Optional[datetime]:
+        """Parse timestamp-like values into naive UTC datetime."""
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            # Heuristic: values over 1e12 are likely milliseconds.
+            if timestamp > 1_000_000_000_000:
+                timestamp /= 1000.0
+            try:
+                return datetime.utcfromtimestamp(timestamp)
+            except (ValueError, OSError):
+                return None
+
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+
+            numeric_match = re.fullmatch(r"\d+(?:\.\d+)?", raw)
+            if numeric_match:
+                return CodexClient._parse_datetime_value(float(raw))
+
+            normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
+
+            if parsed.tzinfo is None:
+                return parsed
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+        return None
+
+    @classmethod
+    def _extract_window_refresh_at(cls, window: Dict[str, Any]) -> Optional[datetime]:
+        """Extract refresh time from rate-limit window metadata."""
+        if not window:
+            return None
+
+        timestamp_keys = (
+            "resets_at",
+            "reset_at",
+            "next_reset_at",
+            "refresh_at",
+            "end_at",
+            "window_end_at",
+            "resetsAt",
+            "resetAt",
+            "nextResetAt",
+        )
+        for key in timestamp_keys:
+            refresh_at = cls._parse_datetime_value(window.get(key))
+            if refresh_at:
+                return refresh_at
+
+        relative_keys = (
+            "seconds_until_reset",
+            "seconds_to_reset",
+            "remaining_seconds",
+            "reset_in_seconds",
+            "seconds_until_refresh",
+            "seconds_to_refresh",
+        )
+        for key in relative_keys:
+            value = window.get(key)
+            if value is None:
+                continue
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            if seconds < 0:
+                continue
+            return datetime.utcnow() + timedelta(seconds=seconds)
+
+        return None
 
     def _parse_status_output(self, output: str) -> UsageInfo:
         """
@@ -467,12 +594,41 @@ class CodexClient:
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Try Codex format: "XX% left"
-        # Example: "100% left" or "gpt-5.3-codex xhigh · 100% left"
-        left_match = re.search(r'(\d+)%\s*left', output, re.IGNORECASE)
-        if left_match:
-            percentage = float(left_match.group(1))
+        # Try Codex format: "XX% left" (skip "context left" decorations).
+        # Examples:
+        # - "gpt-5.3-codex xhigh · 69% left"
+        # - "69% left"
+        left_matches = []
+        for match in re.finditer(r'(\d+(?:\.\d+)?)%\s*left\b', output, re.IGNORECASE):
+            trailing = output[match.end(): match.end() + 24].lstrip().lower()
+            if trailing.startswith("context"):
+                continue
+            left_matches.append(float(match.group(1)))
+
+        if left_matches:
+            # Prefer the last status-like match from the output stream.
+            percentage = left_matches[-1]
             # Assume default quota of 100000 units
+            total = 100000
+            remaining = int(total * percentage / 100)
+            used = total - remaining
+
+            return UsageInfo(
+                total=total,
+                used=used,
+                remaining=remaining,
+                percentage=percentage,
+                last_checked=datetime.utcnow(),
+            )
+
+        # Some Codex variants report "XX% used". Convert to remaining percent.
+        used_matches = [
+            float(match.group(1))
+            for match in re.finditer(r'(\d+(?:\.\d+)?)%\s*used\b', output, re.IGNORECASE)
+        ]
+        if used_matches:
+            used_percent = used_matches[-1]
+            percentage = max(0.0, min(100.0, 100.0 - used_percent))
             total = 100000
             remaining = int(total * percentage / 100)
             used = total - remaining

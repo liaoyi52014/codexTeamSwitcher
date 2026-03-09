@@ -86,7 +86,16 @@ class TeamSwitcher:
             Current Team object, or None if no team is active.
         """
         if self._current_team_id:
-            return self._token_manager.get_team_by_id(self._current_team_id)
+            team = self._token_manager.get_team_by_id(self._current_team_id)
+            if team:
+                return team
+
+        # Keep UI/runtime state aligned with the actually effective Codex auth.
+        auth_matched_team = self._token_manager.get_team_matching_codex_auth()
+        if auth_matched_team:
+            self._current_team_id = auth_matched_team.id
+            return auth_matched_team
+
         return self._token_manager.get_active_team()
 
     def set_current_team(self, team_id: str) -> None:
@@ -134,7 +143,10 @@ class TeamSwitcher:
                 continue
 
             # Check if team has sufficient quota
-            if team.quota_percentage and team.quota_percentage < self._threshold:
+            if (
+                team.quota_percentage is not None
+                and team.quota_percentage < self._threshold
+            ):
                 self._logger.warning(
                     "skipping_team_low_quota",
                     team_id=team.id,
@@ -250,7 +262,8 @@ class TeamSwitcher:
         Raises:
             NoAvailableTeamError: If no team is available.
         """
-        exclude_teams = [self._current_team_id] if exclude_current and self._current_team_id else []
+        current_team = self.get_current_team()
+        exclude_teams = [current_team.id] if exclude_current and current_team else []
 
         target_team = self.get_next_available_team(exclude_teams=exclude_teams)
 
@@ -284,7 +297,10 @@ class TeamSwitcher:
             raise SwitchValidationError(f"Team token is expired: {team.id}")
 
         # Check quota if available
-        if team.quota_percentage and team.quota_percentage < self._threshold:
+        if (
+            team.quota_percentage is not None
+            and team.quota_percentage < self._threshold
+        ):
             raise SwitchValidationError(
                 f"Team quota too low: {team.quota_percentage:.1f}% < {self._threshold}%"
             )
@@ -292,7 +308,13 @@ class TeamSwitcher:
         # Verify we can actually access the team
         try:
             token = self._token_manager.get_decrypted_token(team.id)
-            usage = self._codex_client.get_usage(token, timeout=10)
+            from src.utils.codex_auth import get_codex_account_id
+
+            usage = self._codex_client.get_usage(
+                token,
+                timeout=10,
+                account_id=get_codex_account_id(auth_json=team.get_auth_json()),
+            )
 
             if usage.percentage < self._threshold:
                 raise SwitchValidationError(

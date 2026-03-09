@@ -2,8 +2,10 @@
 
 import json
 import os
+import signal
+import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
 
@@ -18,6 +20,28 @@ class CodexAuth:
     expires_at: Optional[str] = None
     organization_id: Optional[str] = None
     organization_name: Optional[str] = None
+
+
+def _select_default_organization(organizations: Any) -> Optional[Dict[str, Any]]:
+    """
+    Select the default organization/workspace from a list.
+
+    Prefers item with `is_default=true`, falls back to first entry.
+    """
+    if not isinstance(organizations, list) or not organizations:
+        return None
+
+    valid_orgs: List[Dict[str, Any]] = [
+        org for org in organizations if isinstance(org, dict)
+    ]
+    if not valid_orgs:
+        return None
+
+    for org in valid_orgs:
+        if org.get("is_default"):
+            return org
+
+    return valid_orgs[0]
 
 
 def get_codex_auth_path() -> Path:
@@ -63,8 +87,11 @@ def extract_codex_auth(auth_json: Optional[Dict[str, Any]] = None) -> Optional[C
 
     try:
         # Get tokens object
+        mode = str(auth_json.get("auth_mode", "")).lower()
         tokens = auth_json.get("tokens")
-        if not tokens:
+        if not isinstance(tokens, dict):
+            if mode and mode not in ("chatgpt", "chatgpt_auth_tokens"):
+                return None
             return None
 
         # Get access_token
@@ -72,22 +99,13 @@ def extract_codex_auth(auth_json: Optional[Dict[str, Any]] = None) -> Optional[C
         if not access_token:
             return None
 
-        # Get account_id
-        account_id = tokens.get("account_id")
-        if not account_id:
-            # Try to extract from id_token
-            id_token = tokens.get("id_token")
-            if id_token:
-                account_id = _extract_account_id_from_jwt(id_token)
-
-        if not account_id:
-            return None
-
         # Get email and plan_type from JWT
+        account_id = tokens.get("account_id")
         email = None
         plan_type = None
         organization_id = None
         organization_name = None
+
         id_token = tokens.get("id_token")
         if id_token:
             claims = _decode_jwt_payload(id_token)
@@ -98,13 +116,23 @@ def extract_codex_auth(auth_json: Optional[Dict[str, Any]] = None) -> Optional[C
                     account_id = auth_claim.get("chatgpt_account_id")
                 plan_type = auth_claim.get("chatgpt_plan_type")
 
-                # Extract organization info from the "organizations" claim in id_token
-                organizations = claims.get("organizations", [])
-                if organizations:
-                    # Get the default organization (or first one)
-                    org = organizations[0]
+                # Most id_tokens place organizations under the auth claim.
+                organizations = auth_claim.get("organizations")
+                if organizations is None:
+                    # Backward compatibility: some payloads may expose it at top-level.
+                    organizations = claims.get("organizations")
+
+                org = _select_default_organization(organizations)
+                if org:
                     organization_id = org.get("id")
-                    organization_name = org.get("title")
+                    organization_name = org.get("title") or org.get("name")
+
+        if not account_id:
+            # Final fallback: try extracting from JWT helper.
+            if id_token:
+                account_id = _extract_account_id_from_jwt(id_token)
+            if not account_id:
+                return None
 
         return CodexAuth(
             account_id=account_id,
@@ -181,27 +209,27 @@ def load_codex_token() -> Optional[str]:
     return auth_json.get("OPENAI_API_KEY")
 
 
-def get_codex_account_id() -> Optional[str]:
+def get_codex_account_id(auth_json: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     Get account ID from Codex auth file.
+
+    Args:
+        auth_json: Optional auth JSON object. If omitted, loads ~/.codex/auth.json.
 
     Returns:
         Account ID string if available, None otherwise.
     """
-    auth_path = get_codex_auth_path()
+    auth = extract_codex_auth(auth_json=auth_json)
+    if auth:
+        return auth.account_id
 
-    if not auth_path.exists():
+    if auth_json is None:
+        auth_json = load_codex_auth_json()
+    if not auth_json:
         return None
 
-    try:
-        with open(auth_path, "r") as f:
-            auth_data = json.load(f)
-
-        tokens = auth_data.get("tokens", {})
-        return tokens.get("account_id")
-
-    except (json.JSONDecodeError, IOError):
-        return None
+    tokens = auth_json.get("tokens", {})
+    return tokens.get("account_id")
 
 
 def is_codex_logged_in() -> bool:
@@ -230,6 +258,53 @@ def switch_codex_account(auth_json: Dict[str, Any]) -> bool:
         with open(auth_path, "w") as f:
             json.dump(auth_json, f, indent=2)
 
+        # Terminate all active Codex sessions after switching auth
+        terminate_all_codex_sessions()
+
+        return True
+    except Exception:
+        return False
+
+
+def terminate_all_codex_sessions() -> bool:
+    """
+    Terminate all running Codex sessions/processes.
+
+    This ensures a clean switch by closing all active Codex
+    sessions before the new account takes effect.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        # Get current process PID to exclude it
+        current_pid = os.getpid()
+
+        # Find all Codex processes
+        result = subprocess.run(
+            ["pgrep", "-f", "codex"],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode == 0:
+            pids = result.stdout.strip().split("\n")
+            for pid in pids:
+                if pid:
+                    try:
+                        pid_int = int(pid)
+                        # Skip current process and its parent (the Flask/admin process)
+                        if pid_int == current_pid:
+                            continue
+                        # Try graceful termination first
+                        os.kill(pid_int, signal.SIGTERM)
+                    except ProcessLookupError:
+                        # Process already terminated
+                        pass
+                    except PermissionError:
+                        # Cannot kill process (may be a different user)
+                        pass
+
         return True
     except Exception:
         return False
@@ -250,6 +325,8 @@ def get_current_auth_info() -> Optional[Dict[str, Any]]:
         "account_id": auth.account_id,
         "email": auth.email,
         "plan_type": auth.plan_type,
+        "organization_id": auth.organization_id,
+        "organization_name": auth.organization_name,
         "is_logged_in": True,
     }
 

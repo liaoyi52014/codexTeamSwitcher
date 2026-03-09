@@ -1,8 +1,9 @@
 """Token Manager Service for managing OAuth tokens."""
 
-import json
+import hashlib
+import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from cryptography.fernet import InvalidToken
 
@@ -10,10 +11,10 @@ from src.models.team import Team
 from src.utils.crypto import TokenEncryptor
 from src.utils.codex_auth import (
     extract_codex_auth,
+    CodexAuth,
     load_codex_auth_json,
     switch_codex_account,
     is_codex_logged_in,
-    get_organization_name,
 )
 from src.utils.logger import get_logger
 
@@ -57,6 +58,77 @@ class TokenManager:
         self._db = db_session
         self._encryptor = TokenEncryptor(encryption_key)
         self._logger = get_logger(__name__)
+
+    @staticmethod
+    def _sanitize_id_part(value: Optional[str], max_len: int, fallback: str) -> str:
+        """Sanitize string to a safe identifier fragment."""
+        if not value:
+            return fallback
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", value).strip("-")
+        if not sanitized:
+            return fallback
+        return sanitized[:max_len]
+
+    def _build_team_id(self, account_id: str, organization_id: Optional[str]) -> str:
+        """
+        Build stable team id from account + workspace identity.
+
+        This avoids collisions when different accounts share same workspace title/id.
+        """
+        account_part = self._sanitize_id_part(account_id, max_len=8, fallback="account")
+        org_part = self._sanitize_id_part(organization_id, max_len=12, fallback="default")
+        identity_key = f"{account_id}:{organization_id or 'default'}"
+        identity_hash = hashlib.sha1(identity_key.encode("utf-8")).hexdigest()[:8]
+        return f"team-{account_part}-{org_part}-{identity_hash}"
+
+    def _build_team_name(self, auth: CodexAuth, name: Optional[str]) -> str:
+        """Build user-facing team name."""
+        if name and name.strip():
+            return name.strip()
+
+        account_short = auth.account_id[:8] if auth.account_id else "unknown"
+        if auth.organization_name:
+            return f"{auth.organization_name} ({account_short})"
+        if auth.email:
+            return f"{auth.email} ({account_short})"
+        if auth.organization_id:
+            return f"{auth.organization_id} ({account_short})"
+        return f"team-{account_short}"
+
+    def _extract_identity_from_team(self, team: Team) -> Tuple[Optional[str], Optional[str]]:
+        """Extract (account_id, organization_id) from a stored team auth_json."""
+        auth_json = team.get_auth_json()
+        if not auth_json:
+            return None, team.organization_id
+
+        auth = extract_codex_auth(auth_json)
+        if not auth:
+            return None, team.organization_id
+
+        return auth.account_id, auth.organization_id
+
+    def _find_team_by_identity(
+        self,
+        account_id: str,
+        organization_id: Optional[str],
+    ) -> Optional[Team]:
+        """Find existing team by identity to avoid duplicate imports after upgrades."""
+        for team in self.get_all_teams():
+            team_account_id, team_org_id = self._extract_identity_from_team(team)
+            if team_account_id != account_id:
+                continue
+
+            # If target org is known, require exact match.
+            if organization_id:
+                if team_org_id == organization_id:
+                    return team
+                continue
+
+            # Target org unknown: match only when stored team has no org context.
+            if not team_org_id:
+                return team
+
+        return None
 
     def get_all_teams(self) -> List[Team]:
         """
@@ -102,6 +174,45 @@ class TokenManager:
         """
         teams = self.get_enabled_teams()
         return teams[0] if teams else None
+
+    def get_team_matching_codex_auth(
+        self,
+        auth_json: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Team]:
+        """
+        Resolve the team that matches current Codex auth identity.
+
+        Matching order:
+        1) exact account + workspace identity
+        2) if exactly one team has the same account, use it
+
+        Args:
+            auth_json: Optional auth JSON override. If omitted, uses ~/.codex/auth.json.
+
+        Returns:
+            Matching team, or None when no unambiguous match exists.
+        """
+        auth = extract_codex_auth(auth_json=auth_json)
+        if not auth:
+            return None
+
+        matched = self._find_team_by_identity(
+            account_id=auth.account_id,
+            organization_id=auth.organization_id,
+        )
+        if matched:
+            return matched
+
+        account_matches: List[Team] = []
+        for team in self.get_all_teams():
+            team_account_id, _ = self._extract_identity_from_team(team)
+            if team_account_id == auth.account_id:
+                account_matches.append(team)
+
+        if len(account_matches) == 1:
+            return account_matches[0]
+
+        return None
 
     def add_team(
         self,
@@ -287,6 +398,8 @@ class TokenManager:
         quota_remaining: int,
         usage_5h_percent: float = 100.0,
         usage_weekly_percent: float = 100.0,
+        refresh_at_5h: Optional[datetime] = None,
+        refresh_at_weekly: Optional[datetime] = None,
     ) -> Team:
         """
         Update a team's quota information.
@@ -298,6 +411,8 @@ class TokenManager:
             quota_remaining: Remaining quota.
             usage_5h_percent: 5-hour window remaining percentage.
             usage_weekly_percent: Weekly remaining percentage.
+            refresh_at_5h: 5-hour window refresh time (UTC).
+            refresh_at_weekly: Weekly window refresh time (UTC).
 
         Returns:
             Updated Team object.
@@ -322,6 +437,8 @@ class TokenManager:
         # Store 5h and weekly percentages
         team.quota_5h_percentage = usage_5h_percent
         team.quota_weekly_percentage = usage_weekly_percent
+        team.quota_5h_refresh_at = refresh_at_5h
+        team.quota_weekly_refresh_at = refresh_at_weekly
 
         team.quota_last_checked = datetime.utcnow()
         self._db.commit()
@@ -355,6 +472,45 @@ class TokenManager:
 
         return result
 
+    def normalize_team_metadata_from_auth(self) -> int:
+        """
+        Backfill team metadata from stored auth_json for legacy records.
+
+        Returns:
+            Number of teams updated.
+        """
+        updated_count = 0
+
+        for team in self.get_all_teams():
+            auth_json = team.get_auth_json()
+            if not auth_json:
+                continue
+
+            auth = extract_codex_auth(auth_json)
+            if not auth:
+                continue
+
+            changed = False
+            if auth.organization_id and team.organization_id != auth.organization_id:
+                team.organization_id = auth.organization_id
+                changed = True
+
+            # Keep explicit custom names; only backfill legacy placeholder names.
+            if (not team.name or team.name == team.id or team.name.startswith("team-")):
+                expected_name = self._build_team_name(auth=auth, name=None)
+                if expected_name and expected_name != team.name:
+                    team.name = expected_name
+                    changed = True
+
+            if changed:
+                updated_count += 1
+
+        if updated_count > 0:
+            self._db.commit()
+            self._logger.info("teams_metadata_backfilled", count=updated_count)
+
+        return updated_count
+
     def import_current_codex_account(self, name: Optional[str] = None) -> Optional[Team]:
         """
         Import the currently logged in Codex account as a team.
@@ -386,27 +542,39 @@ class TokenManager:
             self._logger.warning("failed_to_load_auth_json")
             return None
 
-        # Determine team name and ID based on organization
-        # Use organization_id for unique identification if available
-        if auth.organization_id:
-            team_id = f"team-{auth.organization_id}"
-        else:
-            team_id = f"team-{auth.account_id[:8]}"
+        # Build identity-based team id/name to support:
+        # - multiple accounts
+        # - multiple workspaces under the same account
+        team_id = self._build_team_id(
+            account_id=auth.account_id,
+            organization_id=auth.organization_id,
+        )
+        team_name = self._build_team_name(auth=auth, name=name)
 
-        # Use team_id as the display name
-        team_name = team_id
-
-        # Check if team already exists
+        # Check if team already exists (id match first, then identity match for legacy data).
         existing = self.get_team_by_id(team_id)
+        if not existing:
+            existing = self._find_team_by_identity(
+                account_id=auth.account_id,
+                organization_id=auth.organization_id,
+            )
+
         if existing:
             # Update existing team
             existing.name = team_name
+            existing.organization_id = auth.organization_id
             existing.set_auth_json(auth_json)
             existing.access_token = self._encryptor.encrypt(auth.access_token)
             if auth.refresh_token:
                 existing.refresh_token = self._encryptor.encrypt(auth.refresh_token)
             self._db.commit()
-            self._logger.info("team_updated", team_id=team_id, name=team_name)
+            self._logger.info(
+                "team_updated",
+                team_id=existing.id,
+                name=team_name,
+                account_id=auth.account_id,
+                organization_id=auth.organization_id,
+            )
             return existing
 
         # Create new team
@@ -415,7 +583,7 @@ class TokenManager:
             name=team_name,
             access_token=self._encryptor.encrypt(auth.access_token),
             refresh_token=self._encryptor.encrypt(auth.refresh_token) if auth.refresh_token else None,
-            organization_id=auth.account_id,
+            organization_id=auth.organization_id,
             priority=len(self.get_all_teams()) + 1,
             enabled=True,
         )
@@ -424,7 +592,14 @@ class TokenManager:
         self._db.add(team)
         self._db.commit()
 
-        self._logger.info("team_imported", team_id=team_id, name=team_name, email=auth.email)
+        self._logger.info(
+            "team_imported",
+            team_id=team_id,
+            name=team_name,
+            email=auth.email,
+            account_id=auth.account_id,
+            organization_id=auth.organization_id,
+        )
         return team
 
     def switch_to_team(self, team_id: str) -> bool:
@@ -479,4 +654,6 @@ class TokenManager:
             "account_id": auth.account_id,
             "email": auth.email,
             "plan_type": auth.plan_type,
+            "organization_id": auth.organization_id,
+            "organization_name": auth.organization_name,
         }

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from src.models.team import Team
 from src.services.codex_client import CodexClient, UsageInfo, StatusCommandError
 from src.services.token_manager import TokenManager
+from src.utils.codex_auth import get_codex_account_id
 from src.utils.logger import get_logger, log_usage_check
 
 
@@ -106,8 +107,13 @@ class UsageMonitor:
             # Get decrypted token
             token = self._token_manager.get_decrypted_token(team.id)
 
-            # Execute status command
-            usage = self._codex_client.get_usage(token, team_id=team.id)
+            # Execute usage query with the team's own account context when available.
+            team_account_id = get_codex_account_id(auth_json=team.get_auth_json())
+            usage = self._codex_client.get_usage(
+                token,
+                team_id=team.id,
+                account_id=team_account_id,
+            )
 
             # Update quota in database
             self._token_manager.update_quota(
@@ -117,6 +123,8 @@ class UsageMonitor:
                 quota_remaining=usage.remaining,
                 usage_5h_percent=usage.usage_5h_percent,
                 usage_weekly_percent=usage.usage_weekly_percent,
+                refresh_at_5h=usage.refresh_at_5h,
+                refresh_at_weekly=usage.refresh_at_weekly,
             )
 
             # Log the usage check

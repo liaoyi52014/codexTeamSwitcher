@@ -52,6 +52,10 @@ class Team(Base):
     quota_5h_percentage: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=100.0)
     # Weekly usage percentage (remaining)
     quota_weekly_percentage: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=100.0)
+    # Next refresh time for 5-hour window
+    quota_5h_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Next refresh time for weekly window
+    quota_weekly_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # Last time quota was checked
     quota_last_checked: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -108,6 +112,7 @@ class Team(Base):
         result = {
             "id": self.id,
             "name": self.name,
+            "organization_id": self.organization_id,
             "priority": self.priority,
             "enabled": self.enabled,
             "status_command": self.status_command,
@@ -118,6 +123,8 @@ class Team(Base):
                 "percentage": self.quota_percentage,
                 "percentage_5h": self.quota_5h_percentage,
                 "percentage_weekly": self.quota_weekly_percentage,
+                "refresh_at_5h": self.quota_5h_refresh_at.isoformat() if self.quota_5h_refresh_at else None,
+                "refresh_at_weekly": self.quota_weekly_refresh_at.isoformat() if self.quota_weekly_refresh_at else None,
                 "last_checked": self.quota_last_checked.isoformat() if self.quota_last_checked else None,
             },
             "is_token_expired": self.is_token_expired,

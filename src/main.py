@@ -81,6 +81,7 @@ class CodexTeamSwitcher:
 
         # Create tables
         Base.metadata.create_all(self._engine)
+        self._ensure_schema_compatibility()
 
         # Create session
         self._Session = sessionmaker(bind=self._engine)
@@ -136,13 +137,43 @@ class CodexTeamSwitcher:
             else:
                 self._logger.warning("auto_import_failed_no_codex_login")
 
-        # Set current team
-        active_team = self._token_manager.get_active_team()
+        # Backfill metadata for legacy records (workspace id/name from auth_json).
+        self._token_manager.normalize_team_metadata_from_auth()
+
+        # Set current team (prefer current Codex auth identity; fallback to priority order).
+        active_team = (
+            self._token_manager.get_team_matching_codex_auth()
+            or self._token_manager.get_active_team()
+        )
         if active_team:
             self._team_switcher.set_current_team(active_team.id)
             self._logger.info("active_team_set", team_id=active_team.id)
 
         self._logger.info("application_initialized")
+
+    def _ensure_schema_compatibility(self) -> None:
+        """Apply lightweight schema upgrades for existing SQLite databases."""
+        required_columns = {
+            "quota_5h_refresh_at": "DATETIME",
+            "quota_weekly_refresh_at": "DATETIME",
+        }
+
+        with self._engine.begin() as conn:
+            rows = conn.exec_driver_sql("PRAGMA table_info(teams)").fetchall()
+            existing_columns = {row[1] for row in rows}
+
+            for column_name, column_type in required_columns.items():
+                if column_name in existing_columns:
+                    continue
+                conn.exec_driver_sql(
+                    f"ALTER TABLE teams ADD COLUMN {column_name} {column_type}"
+                )
+                self._logger.info(
+                    "database_column_added",
+                    table="teams",
+                    column=column_name,
+                    column_type=column_type,
+                )
 
     def _setup_callbacks(self) -> None:
         """Set up service callbacks."""
@@ -282,6 +313,7 @@ class CodexTeamSwitcher:
 
         self._proxy_service = create_proxy_from_switcher(
             token_manager=self._token_manager,
+            team_switcher=self._team_switcher,
             host=self._config.app.proxy_host,
             port=self._config.app.proxy_port,
         )
@@ -341,7 +373,12 @@ class CodexTeamSwitcher:
         Returns:
             Dictionary with status information.
         """
-        current_team = self._team_switcher.get_current_team()
+        current_team = (
+            self._token_manager.get_team_matching_codex_auth()
+            or self._team_switcher.get_current_team()
+        )
+        if current_team:
+            self._team_switcher.set_current_team(current_team.id)
         teams_status = self._token_manager.get_teams_by_status()
 
         return {

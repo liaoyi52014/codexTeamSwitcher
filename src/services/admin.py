@@ -1,12 +1,223 @@
 """Web Admin Interface for Codex Team Switcher."""
 
 import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import time
 from datetime import datetime
+from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, redirect, url_for
 from flask_socketio import SocketIO, emit
 from typing import Dict, Any, Optional, List
 
 from src.utils.logger import get_logger
+
+
+def _is_codex_command(command: str) -> bool:
+    """Check if a process command line points to the codex CLI."""
+    if not command:
+        return False
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    for token in tokens:
+        if os.path.basename(token) == "codex":
+            return True
+
+        lowered = token.lower()
+        if "@openai/codex" in lowered and lowered.endswith(".js"):
+            return True
+
+    return False
+
+
+def _get_ancestor_pids(pid: int) -> List[int]:
+    """Get ancestor PIDs for a process (parent, grandparent, ...)."""
+    ancestors: List[int] = []
+    current_pid = pid
+
+    while current_pid > 1:
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(current_pid)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parent_pid = int(result.stdout.strip())
+        except Exception:
+            break
+
+        if parent_pid <= 1 or parent_pid in ancestors:
+            break
+
+        ancestors.append(parent_pid)
+        current_pid = parent_pid
+
+    return ancestors
+
+
+def _list_codex_processes(exclude_pid: Optional[int] = None) -> List[int]:
+    """
+    List PIDs for running codex CLI processes.
+
+    Args:
+        exclude_pid: Optional PID to exclude (for safety).
+
+    Returns:
+        List of matching process IDs.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return []
+
+    current_pid = os.getpid()
+    excluded_pids = {current_pid, *_get_ancestor_pids(current_pid)}
+    if exclude_pid:
+        excluded_pids.add(exclude_pid)
+
+    pids: List[int] = []
+
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+
+        pid_str, command = parts
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+
+        if pid in excluded_pids:
+            continue
+
+        if _is_codex_command(command):
+            pids.append(pid)
+
+    return pids
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process PID is still alive."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_codex_sessions(grace_period_seconds: float = 2.0) -> Dict[str, Any]:
+    """
+    Terminate all running codex CLI sessions.
+
+    Sends SIGTERM first, then SIGKILL for any process that remains alive
+    after the grace period.
+    """
+    matched = _list_codex_processes()
+    failed: List[Dict[str, Any]] = []
+    term_sent: List[int] = []
+    already_exited: List[int] = []
+
+    for pid in matched:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            term_sent.append(pid)
+        except ProcessLookupError:
+            already_exited.append(pid)
+        except PermissionError:
+            failed.append({"pid": pid, "error": "permission_denied_on_sigterm"})
+
+    deadline = time.time() + max(0.0, grace_period_seconds)
+    while time.time() < deadline:
+        if not any(_is_pid_alive(pid) for pid in term_sent):
+            break
+        time.sleep(0.1)
+
+    alive_after_term = [pid for pid in term_sent if _is_pid_alive(pid)]
+    terminated_gracefully = [pid for pid in term_sent if pid not in alive_after_term]
+
+    kill_sent: List[int] = []
+    for pid in alive_after_term:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            kill_sent.append(pid)
+        except ProcessLookupError:
+            terminated_gracefully.append(pid)
+        except PermissionError:
+            failed.append({"pid": pid, "error": "permission_denied_on_sigkill"})
+
+    # Small wait to let SIGKILL take effect.
+    if kill_sent:
+        time.sleep(0.1)
+
+    terminated_by_kill = [pid for pid in kill_sent if not _is_pid_alive(pid)]
+    still_alive = [pid for pid in kill_sent if _is_pid_alive(pid)]
+    for pid in still_alive:
+        failed.append({"pid": pid, "error": "still_alive_after_sigkill"})
+
+    terminated = sorted(set(already_exited + terminated_gracefully + terminated_by_kill))
+
+    return {
+        "matched": len(matched),
+        "terminated": terminated,
+        "force_killed": sorted(terminated_by_kill),
+        "still_alive": sorted(still_alive),
+        "failed": failed,
+    }
+
+
+def get_latest_codex_session_id() -> Optional[str]:
+    """
+    Get the latest local Codex session ID from ~/.codex/sessions.
+
+    Returns:
+        Session UUID string if found, otherwise None.
+    """
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.exists():
+        return None
+
+    try:
+        candidates = list(sessions_root.rglob("rollout-*.jsonl"))
+    except Exception:
+        return None
+
+    if not candidates:
+        return None
+
+    try:
+        latest_file = max(candidates, key=lambda p: p.stat().st_mtime_ns)
+    except Exception:
+        return None
+
+    match = re.search(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+        latest_file.name,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    return match.group(1)
 
 
 # HTML template for the admin interface
@@ -97,18 +308,24 @@ ADMIN_HTML = """
         }
         .team-list {
             display: grid;
-            gap: 15px;
+            gap: 12px;
         }
         .team-item {
-            display: flex;
+            display: grid;
+            grid-template-columns: minmax(220px, 1fr) auto;
+            gap: 20px;
             align-items: center;
-            justify-content: space-between;
-            padding: 12px 16px;
-            background: white;
-            border-radius: 10px;
-            border: 1px solid #eee;
-            margin-bottom: 10px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            padding: 14px 16px;
+            background: linear-gradient(180deg, #ffffff 0%, #fbfcff 100%);
+            border-radius: 12px;
+            border: 1px solid #e7ebf3;
+            border-left: 4px solid transparent;
+            box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
+            transition: box-shadow 0.2s ease, transform 0.2s ease;
+        }
+        .team-item:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.1);
         }
         .team-item.active {
             border-left-color: #10b981;
@@ -139,12 +356,14 @@ ADMIN_HTML = """
             color: #999;
         }
         .team-stats {
-            display: flex;
-            gap: 20px;
+            display: grid;
+            grid-template-columns: 176px 176px 248px;
+            gap: 12px;
             align-items: center;
         }
         .stat {
-            text-align: center;
+            text-align: left;
+            padding: 6px 8px;
         }
         .stat-label {
             font-size: 10px;
@@ -155,8 +374,26 @@ ADMIN_HTML = """
             font-size: 14px;
             font-weight: 600;
         }
+        .stat-refresh {
+            font-size: 10px;
+            color: #6b7280;
+            margin-top: 2px;
+            white-space: nowrap;
+            font-variant-numeric: tabular-nums;
+            display: block;
+            width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .usage-track {
+            width: 100%;
+        }
+        .usage-track .stat-refresh,
+        .usage-track .quota-bar {
+            width: 100%;
+        }
         .quota-bar {
-            width: 60px;
+            width: 100%;
             height: 6px;
             background: #e5e7eb;
             border-radius: 3px;
@@ -172,11 +409,13 @@ ADMIN_HTML = """
         .quota-fill.medium { background: #f59e0b; }
         .quota-fill.low { background: #ef4444; }
         .btn {
-            padding: 6px 12px;
+            padding: 7px 12px;
             border: none;
-            border-radius: 6px;
+            border-radius: 8px;
             cursor: pointer;
             font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
             transition: all 0.2s;
         }
         .btn-primary {
@@ -202,7 +441,30 @@ ADMIN_HTML = """
         }
         .actions {
             display: flex;
-            gap: 10px;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        @media (max-width: 1220px) {
+            .team-item {
+                grid-template-columns: 1fr;
+                gap: 14px;
+            }
+            .team-stats {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .actions {
+                grid-column: 1 / -1;
+                justify-content: flex-start;
+                flex-wrap: wrap;
+            }
+        }
+        @media (max-width: 760px) {
+            .team-stats {
+                grid-template-columns: 1fr;
+            }
+            .actions .btn {
+                flex: 1;
+            }
         }
         .refresh-btn {
             position: fixed;
@@ -399,6 +661,19 @@ ADMIN_HTML = """
             document.getElementById(tabId).classList.add('active');
         }
 
+        function parseTimestamp(value) {
+            if (!value) return null;
+            const normalized = /[zZ]|[+\\-]\\d{2}:\\d{2}$/.test(value) ? value : `${value}Z`;
+            const date = new Date(normalized);
+            return Number.isNaN(date.getTime()) ? null : date;
+        }
+
+        function formatRefreshTime(value) {
+            const date = parseTimestamp(value);
+            if (!date) return '-';
+            return date.toLocaleString('zh-CN', { hour12: false });
+        }
+
         async function refreshData() {
             const btn = document.querySelector('.refresh-btn');
             btn.classList.add('loading');
@@ -461,6 +736,7 @@ ADMIN_HTML = """
 
         function renderTeamList(teams) {
             const container = document.getElementById('teamList');
+            const currentTeamId = currentData && currentData.current_team ? currentData.current_team.id : null;
 
             if (teams.active.length === 0 && teams.quota_low.length === 0 &&
                 teams.expired.length === 0 && teams.disabled.length === 0) {
@@ -468,43 +744,46 @@ ADMIN_HTML = """
                 return;
             }
 
+            const teamItems = [];
+            teams.active.forEach(team => teamItems.push({team, statusClass: 'active'}));
+            teams.quota_low.forEach(team => teamItems.push({team, statusClass: 'quota-low'}));
+            teams.expired.forEach(team => teamItems.push({team, statusClass: 'expired'}));
+            teams.disabled.forEach(team => teamItems.push({team, statusClass: 'disabled'}));
+
+            const currentItems = [];
+            const otherItems = [];
+            teamItems.forEach(item => {
+                if (currentTeamId && item.team.id === currentTeamId) {
+                    currentItems.push(item);
+                } else {
+                    otherItems.push(item);
+                }
+            });
+
+            const orderedItems = [...currentItems, ...otherItems];
             let html = '';
-
-            // Active teams
-            teams.active.forEach(team => {
-                html += renderTeamItem(team, 'active');
-            });
-
-            // Low quota teams
-            teams.quota_low.forEach(team => {
-                html += renderTeamItem(team, 'quota-low');
-            });
-
-            // Expired teams
-            teams.expired.forEach(team => {
-                html += renderTeamItem(team, 'expired');
-            });
-
-            // Disabled teams
-            teams.disabled.forEach(team => {
-                html += renderTeamItem(team, 'disabled');
+            orderedItems.forEach(item => {
+                html += renderTeamItem(item.team, item.statusClass, currentTeamId);
             });
 
             container.innerHTML = html;
         }
 
-        function renderTeamItem(team, statusClass) {
+        function renderTeamItem(team, statusClass, currentTeamId) {
             // Get 5h and weekly quota percentages
             const quota5h = team.quota ? (team.quota.percentage_5h || team.quota.percentage || 0) : 0;
             const quotaWeekly = team.quota ? (team.quota.percentage_weekly || 0) : 0;
+            const refresh5h = team.quota ? formatRefreshTime(team.quota.refresh_at_5h) : '-';
+            const refreshWeekly = team.quota ? formatRefreshTime(team.quota.refresh_at_weekly) : '-';
             const quotaClass = quota5h > 20 ? 'high' : quota5h > 5 ? 'medium' : 'low';
+            const isCurrent = currentTeamId && team.id === currentTeamId;
 
             return `
                 <div class="team-item ${statusClass}">
                     <div class="team-info">
                         <div class="team-name">
                             ${team.name}
-                            ${statusClass === 'active' ? '<span class="current-badge">当前</span>' : ''}
+                            ${isCurrent ? '<span class="current-badge">当前</span>' : ''}
                         </div>
                         <div class="team-id">${team.id}</div>
                     </div>
@@ -512,25 +791,25 @@ ADMIN_HTML = """
                         <div class="stat">
                             <div class="stat-label">5小时</div>
                             <div class="stat-value">${quota5h.toFixed(1)}%</div>
-                            <div class="quota-bar">
-                                <div class="quota-fill ${quotaClass}" style="width: ${Math.min(quota5h, 100)}%"></div>
+                            <div class="usage-track">
+                                <div class="stat-refresh" title="刷新时间: ${refresh5h}">刷新: ${refresh5h}</div>
+                                <div class="quota-bar">
+                                    <div class="quota-fill ${quotaClass}" style="width: ${Math.min(quota5h, 100)}%"></div>
+                                </div>
                             </div>
                         </div>
                         <div class="stat">
                             <div class="stat-label">周用量</div>
                             <div class="stat-value">${quotaWeekly.toFixed(1)}%</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-label">优先级</div>
-                            <div class="stat-value">${team.priority}</div>
+                            <div class="stat-refresh">刷新: ${refreshWeekly}</div>
                         </div>
                         <div class="actions">
-                            ${(statusClass === 'active' || statusClass === 'quota-low') ? `
-                                <button class="btn btn-primary" onclick="switchToTeam('${team.id}')">切换</button>
-                                <button class="btn btn-danger" onclick="setMockUsage('${team.id}', 4.0)" title="设为4%触发切换">模拟4%</button>
-                                <button class="btn btn-success" onclick="clearMockUsage('${team.id}')" title="清除模拟">清除</button>
-                            ` : `
-                                <button class="btn btn-danger" onclick="deleteTeam('${team.id}')" title="删除团队">删除</button>
+                            ${isCurrent ? '' : `
+                                ${(statusClass === 'active' || statusClass === 'quota-low') ? `
+                                    <button class="btn btn-primary" onclick="switchToTeam('${team.id}')">切换账号</button>
+                                ` : `
+                                    <button class="btn btn-danger" onclick="deleteTeam('${team.id}')" title="删除团队">删除</button>
+                                `}
                             `}
                         </div>
                     </div>
@@ -576,6 +855,8 @@ ADMIN_HTML = """
             // Get quota values
             const quota5h = current && current.quota ? (current.quota.percentage_5h || current.quota.percentage || 0) : 0;
             const quotaWeekly = current && current.quota ? (current.quota.percentage_weekly || 0) : 0;
+            const refresh5h = current && current.quota ? formatRefreshTime(current.quota.refresh_at_5h) : '-';
+            const refreshWeekly = current && current.quota ? formatRefreshTime(current.quota.refresh_at_weekly) : '-';
 
             container.innerHTML = `
                 <div class="info-row">
@@ -599,6 +880,14 @@ ADMIN_HTML = """
                     <div class="info-value">${quotaWeekly.toFixed(1)}%</div>
                 </div>
                 <div class="info-row">
+                    <div class="info-label">5小时刷新时间</div>
+                    <div class="info-value">${refresh5h}</div>
+                </div>
+                <div class="info-row">
+                    <div class="info-label">周用量刷新时间</div>
+                    <div class="info-value">${refreshWeekly}</div>
+                </div>
+                <div class="info-row">
                     <div class="info-label">已用配额</div>
                     <div class="info-value">${current && current.quota ? current.quota.used : '-'}</div>
                 </div>
@@ -610,55 +899,39 @@ ADMIN_HTML = """
         }
 
         async function switchToTeam(teamId) {
-            if (!confirm('确定要切换到该 Team 吗？')) return;
+            if (!confirm('确定要切换账号吗？')) return;
 
             try {
-                const response = await fetch('/api/switch', {
+                const response = await fetch('/api/switch-account', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({team_id: teamId})
+                    body: JSON.stringify({
+                        team_id: teamId,
+                        sync_active_team: true,
+                        terminate_codex_sessions: false
+                    })
                 });
 
                 const result = await response.json();
 
                 if (result.success) {
-                    alert('切换成功！');
+                    const summary = result.terminated_codex_sessions;
+                    const terminatedCount = summary && summary.terminated ? summary.terminated.length : 0;
+                    const stillAliveCount = summary && summary.still_alive ? summary.still_alive.length : 0;
+                    const resumeCommand = result.resume_command || 'codex resume --last';
+                    let message = '切换成功！';
+                    if (summary) {
+                        message += `\\n已结束 ${terminatedCount} 个 Codex 会话。`;
+                        if (stillAliveCount > 0) {
+                            message += `\\n仍有 ${stillAliveCount} 个会话未结束，请手动关闭。`;
+                        }
+                    }
+                    message += `\\n如需继续之前会话，请执行：${resumeCommand}`;
+                    alert(message);
                     refreshData();
                 } else {
                     alert('切换失败: ' + result.error);
                 }
-            } catch (error) {
-                alert('请求失败: ' + error);
-            }
-        }
-
-        async function setMockUsage(teamId, percentage) {
-            try {
-                const response = await fetch('/api/mock-usage', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({team_id: teamId, percentage: percentage})
-                });
-
-                const result = await response.json();
-                alert(result.message);
-                refreshData();
-            } catch (error) {
-                alert('请求失败: ' + error);
-            }
-        }
-
-        async function clearMockUsage(teamId) {
-            try {
-                const response = await fetch('/api/mock-usage', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({action: 'clear', team_id: teamId})
-                });
-
-                const result = await response.json();
-                alert(result.message);
-                refreshData();
             } catch (error) {
                 alert('请求失败: ' + error);
             }
@@ -804,35 +1077,6 @@ class AdminInterface:
                 self._logger.error("api_check_error", error=str(e))
                 return jsonify({"error": str(e)}), 500
 
-        @self._app.route("/api/mock-usage", methods=["POST"])
-        def api_mock_usage():
-            """Set mock usage for testing."""
-            try:
-                from src.services.codex_client import set_mock_usage, clear_mock_usage
-
-                data = request.get_json()
-                action = data.get("action", "set")
-
-                if action == "clear":
-                    team_id = data.get("team_id")
-                    clear_mock_usage(team_id)
-                    return jsonify({"success": True, "message": "Mock usage cleared"})
-                else:
-                    team_id = data.get("team_id")
-                    percentage = data.get("percentage", 5.0)
-
-                    if not team_id:
-                        return jsonify({"success": False, "error": "team_id required"}), 400
-
-                    set_mock_usage(team_id, percentage)
-                    return jsonify({
-                        "success": True,
-                        "message": f"Mock usage set: {team_id} = {percentage}%"
-                    })
-            except Exception as e:
-                self._logger.error("api_mock_usage_error", error=str(e))
-                return jsonify({"error": str(e)}), 500
-
         @self._app.route("/api/codex-status", methods=["GET"])
         def api_codex_status():
             """Get current Codex login status."""
@@ -881,14 +1125,52 @@ class AdminInterface:
                 if not token_manager:
                     return jsonify({"success": False, "error": "TokenManager not initialized"}), 500
 
-                data = request.get_json()
+                data = request.get_json() or {}
                 team_id = data.get("team_id")
+                sync_active_team = bool(data.get("sync_active_team", True))
+                terminate_sessions = bool(data.get("terminate_codex_sessions", False))
 
                 if not team_id:
                     return jsonify({"success": False, "error": "team_id required"}), 400
 
                 success = token_manager.switch_to_team(team_id)
-                return jsonify({"success": success})
+                if not success:
+                    return jsonify({
+                        "success": False,
+                        "error": f"Failed to switch account for team: {team_id}",
+                    }), 400
+
+                if sync_active_team:
+                    switcher = getattr(self._app_handler, "_team_switcher", None)
+                    if switcher:
+                        switcher.set_current_team(team_id)
+
+                latest_session_id = get_latest_codex_session_id()
+                resume_command = (
+                    f"codex resume {latest_session_id}"
+                    if latest_session_id
+                    else "codex resume --last"
+                )
+
+                terminated_summary = None
+                if terminate_sessions:
+                    terminated_summary = terminate_codex_sessions()
+                    self._logger.info(
+                        "codex_sessions_terminated",
+                        team_id=team_id,
+                        matched=terminated_summary["matched"],
+                        terminated=len(terminated_summary["terminated"]),
+                        force_killed=len(terminated_summary["force_killed"]),
+                        still_alive=len(terminated_summary["still_alive"]),
+                    )
+
+                return jsonify({
+                    "success": True,
+                    "team_id": team_id,
+                    "terminated_codex_sessions": terminated_summary,
+                    "resume_command": resume_command,
+                    "resume_session_id": latest_session_id,
+                })
             except Exception as e:
                 self._logger.error("api_switch_account_error", error=str(e))
                 return jsonify({"success": False, "error": str(e)}), 500

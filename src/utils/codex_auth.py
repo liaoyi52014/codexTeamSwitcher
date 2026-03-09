@@ -61,7 +61,7 @@ def load_codex_auth_json() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        with open(auth_path, "r") as f:
+        with open(auth_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return None

@@ -1252,12 +1252,22 @@ class AdminInterface:
         )
 
         if blocking:
-            self._socketio.run(self._app, host=self._host, port=self._port)
+            self._socketio.run(
+                self._app,
+                host=self._host,
+                port=self._port,
+                allow_unsafe_werkzeug=True,
+            )
         else:
             import threading
             thread = threading.Thread(
                 target=self._socketio.run,
-                kwargs={"app": self._app, "host": self._host, "port": self._port},
+                kwargs={
+                    "app": self._app,
+                    "host": self._host,
+                    "port": self._port,
+                    "allow_unsafe_werkzeug": True,
+                },
                 daemon=True,
             )
             thread.start()

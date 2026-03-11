@@ -177,7 +177,7 @@ class CodexClient:
                 log_file.close()
 
                 # Read log file for debugging
-                with open(log_file.name, 'r') as f:
+                with open(log_file.name, 'r', encoding='utf-8', errors='replace') as f:
                     log_content = f.read()
 
                 # Clean up

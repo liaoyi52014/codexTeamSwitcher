@@ -360,6 +360,33 @@ ADMIN_HTML = """
             color: #666;
             margin-top: 4px;
         }
+        /* 到期预警颜色 */
+        .team-expiry.expiry-normal {
+            color: #52c41a;  /* 绿色 - 超过5天 */
+        }
+        .team-expiry.expiry-warning {
+            color: #fa8c16;  /* 橙色 - 3-5天 */
+        }
+        .team-expiry.expiry-critical {
+            color: #f5222d;  /* 深红色 - 1-2天 */
+        }
+        .team-expiry.expiry-expired {
+            color: #a8071a;  /* 更深的红色 - 已过期 */
+        }
+        /* 整行背景色预警 */
+        .team-item.expiry-normal {
+            border-left: 3px solid #52c41a;
+        }
+        .team-item.expiry-warning {
+            border-left: 3px solid #fa8c16;
+        }
+        .team-item.expiry-critical {
+            border-left: 3px solid #f5222d;
+        }
+        .team-item.expiry-expired {
+            border-left: 3px solid #a8071a;
+            background-color: #fff1f0;
+        }
         .team-stats {
             display: grid;
             grid-template-columns: 176px 176px 248px;
@@ -786,17 +813,30 @@ ADMIN_HTML = """
             // Get subscription expiry info
             const subscription = team.subscription;
             let expiryDisplay = '';
+            let expiryClass = '';
             if (subscription && subscription.subscription_active_until) {
                 const expiryDate = new Date(subscription.subscription_active_until);
                 const now = new Date();
                 const daysLeft = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
                 const expiryStr = expiryDate.toLocaleDateString('zh-CN');
                 const daysText = daysLeft > 0 ? `(${daysLeft}天后)` : '(已过期)';
-                expiryDisplay = `<div class="team-expiry" title="计划类型: ${subscription.plan_type || '-'}">到期: ${expiryStr} ${daysText}</div>`;
+
+                // 设置到期预警颜色
+                if (daysLeft <= 0) {
+                    expiryClass = 'expiry-expired';  // 已过期 - 红色
+                } else if (daysLeft <= 2) {
+                    expiryClass = 'expiry-critical';  // 1-2天 - 深红色
+                } else if (daysLeft <= 5) {
+                    expiryClass = 'expiry-warning';   // 3-5天 - 橙色
+                } else {
+                    expiryClass = 'expiry-normal';    // 超过5天 - 绿色
+                }
+
+                expiryDisplay = `<div class="team-expiry ${expiryClass}" title="计划类型: ${subscription.plan_type || '-'}">到期: ${expiryStr} ${daysText}</div>`;
             }
 
             return `
-                <div class="team-item ${statusClass}">
+                <div class="team-item ${statusClass} ${expiryClass}">
                     <div class="team-info">
                         <div class="team-name">
                             ${team.name}

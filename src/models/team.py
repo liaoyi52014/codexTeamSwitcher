@@ -109,6 +109,9 @@ class Team(Base):
         Returns:
             Dictionary representation without full tokens.
         """
+        # Get subscription info from auth_json
+        subscription = self.get_subscription_info()
+
         result = {
             "id": self.id,
             "name": self.name,
@@ -127,6 +130,7 @@ class Team(Base):
                 "refresh_at_weekly": self.quota_weekly_refresh_at.isoformat() if self.quota_weekly_refresh_at else None,
                 "last_checked": self.quota_last_checked.isoformat() if self.quota_last_checked else None,
             },
+            "subscription": subscription,
             "is_token_expired": self.is_token_expired,
             "is_quota_low": self.is_quota_low,
         }
@@ -161,3 +165,28 @@ class Team(Base):
             auth_data: Auth JSON dict to store.
         """
         self.auth_json = json.dumps(auth_data)
+
+    def get_subscription_info(self) -> Optional[Dict[str, str]]:
+        """
+        Extract subscription info from stored auth_json.
+
+        Returns:
+            Dict with subscription_active_start, subscription_active_until, plan_type.
+        """
+        auth_json = self.get_auth_json()
+        if not auth_json:
+            return None
+
+        try:
+            from src.utils.codex_auth import extract_codex_auth
+            auth = extract_codex_auth(auth_json=auth_json)
+            if auth:
+                return {
+                    "plan_type": auth.plan_type,
+                    "subscription_active_start": auth.subscription_active_start,
+                    "subscription_active_until": auth.subscription_active_until,
+                }
+        except Exception:
+            pass
+
+        return None

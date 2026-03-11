@@ -20,6 +20,10 @@ class CodexAuth:
     expires_at: Optional[str] = None
     organization_id: Optional[str] = None
     organization_name: Optional[str] = None
+    # Subscription info from JWT auth claim
+    subscription_active_start: Optional[str] = None
+    subscription_active_until: Optional[str] = None
+    subscription_last_checked: Optional[str] = None
 
 
 def _select_default_organization(organizations: Any) -> Optional[Dict[str, Any]]:
@@ -105,6 +109,10 @@ def extract_codex_auth(auth_json: Optional[Dict[str, Any]] = None) -> Optional[C
         plan_type = None
         organization_id = None
         organization_name = None
+        # Subscription info
+        subscription_active_start = None
+        subscription_active_until = None
+        subscription_last_checked = None
 
         id_token = tokens.get("id_token")
         if id_token:
@@ -115,6 +123,11 @@ def extract_codex_auth(auth_json: Optional[Dict[str, Any]] = None) -> Optional[C
                 if not account_id:
                     account_id = auth_claim.get("chatgpt_account_id")
                 plan_type = auth_claim.get("chatgpt_plan_type")
+
+                # Extract subscription info from auth claim
+                subscription_active_start = auth_claim.get("chatgpt_subscription_active_start")
+                subscription_active_until = auth_claim.get("chatgpt_subscription_active_until")
+                subscription_last_checked = auth_claim.get("chatgpt_subscription_last_checked")
 
                 # Most id_tokens place organizations under the auth claim.
                 organizations = auth_claim.get("organizations")
@@ -143,6 +156,9 @@ def extract_codex_auth(auth_json: Optional[Dict[str, Any]] = None) -> Optional[C
             expires_at=tokens.get("expires_at"),
             organization_id=organization_id,
             organization_name=organization_name,
+            subscription_active_start=subscription_active_start,
+            subscription_active_until=subscription_active_until,
+            subscription_last_checked=subscription_last_checked,
         )
 
     except Exception:
@@ -327,6 +343,9 @@ def get_current_auth_info() -> Optional[Dict[str, Any]]:
         "plan_type": auth.plan_type,
         "organization_id": auth.organization_id,
         "organization_name": auth.organization_name,
+        "subscription_active_start": auth.subscription_active_start,
+        "subscription_active_until": auth.subscription_active_until,
+        "subscription_last_checked": auth.subscription_last_checked,
         "is_logged_in": True,
     }
 

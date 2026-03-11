@@ -355,6 +355,11 @@ ADMIN_HTML = """
             font-size: 11px;
             color: #999;
         }
+        .team-expiry {
+            font-size: 11px;
+            color: #666;
+            margin-top: 4px;
+        }
         .team-stats {
             display: grid;
             grid-template-columns: 176px 176px 248px;
@@ -778,6 +783,18 @@ ADMIN_HTML = """
             const quotaClass = quota5h > 20 ? 'high' : quota5h > 5 ? 'medium' : 'low';
             const isCurrent = currentTeamId && team.id === currentTeamId;
 
+            // Get subscription expiry info
+            const subscription = team.subscription;
+            let expiryDisplay = '';
+            if (subscription && subscription.subscription_active_until) {
+                const expiryDate = new Date(subscription.subscription_active_until);
+                const now = new Date();
+                const daysLeft = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
+                const expiryStr = expiryDate.toLocaleDateString('zh-CN');
+                const daysText = daysLeft > 0 ? `(${daysLeft}天后)` : '(已过期)';
+                expiryDisplay = `<div class="team-expiry" title="计划类型: ${subscription.plan_type || '-'}">到期: ${expiryStr} ${daysText}</div>`;
+            }
+
             return `
                 <div class="team-item ${statusClass}">
                     <div class="team-info">
@@ -786,6 +803,7 @@ ADMIN_HTML = """
                             ${isCurrent ? '<span class="current-badge">当前</span>' : ''}
                         </div>
                         <div class="team-id">${team.id}</div>
+                        ${expiryDisplay}
                     </div>
                     <div class="team-stats">
                         <div class="stat">

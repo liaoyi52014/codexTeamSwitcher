@@ -112,10 +112,23 @@ class Team(Base):
         # Get subscription info from auth_json
         subscription = self.get_subscription_info()
 
+        # Extract organization/workspace name from auth_json
+        organization_name = None
+        auth_data = self.get_auth_json()
+        if auth_data:
+            try:
+                from src.utils.codex_auth import extract_codex_auth
+                auth_info = extract_codex_auth(auth_json=auth_data)
+                if auth_info:
+                    organization_name = auth_info.organization_name
+            except Exception:
+                pass
+
         result = {
             "id": self.id,
             "name": self.name,
             "organization_id": self.organization_id,
+            "organization_name": organization_name,
             "priority": self.priority,
             "enabled": self.enabled,
             "status_command": self.status_command,

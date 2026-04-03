@@ -303,6 +303,29 @@ class TokenManager:
 
         return team
 
+    def update_team_name(self, team_id: str, new_name: str) -> bool:
+        """
+        Update the display name of a team.
+
+        Args:
+            team_id: Team identifier.
+            new_name: New team name.
+
+        Returns:
+            True if updated successfully, False if team not found.
+        """
+        team = self.get_team_by_id(team_id)
+        if not team:
+            return False
+
+        if new_name and new_name.strip():
+            team.name = new_name.strip()
+            self._db.commit()
+            self._logger.info("team_name_updated", team_id=team_id, new_name=new_name)
+            return True
+            
+        return False
+
     def delete_team(self, team_id: str) -> bool:
         """
         Delete a team from the database.
@@ -560,8 +583,9 @@ class TokenManager:
             )
 
         if existing:
-            # Update existing team
-            existing.name = team_name
+            # Update existing team, preserve custom name unless explicitly provided
+            if name is not None:
+                existing.name = team_name
             existing.organization_id = auth.organization_id
             existing.set_auth_json(auth_json)
             existing.access_token = self._encryptor.encrypt(auth.access_token)
@@ -571,7 +595,7 @@ class TokenManager:
             self._logger.info(
                 "team_updated",
                 team_id=existing.id,
-                name=team_name,
+                name=existing.name,
                 account_id=auth.account_id,
                 organization_id=auth.organization_id,
             )

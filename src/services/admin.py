@@ -360,32 +360,11 @@ ADMIN_HTML = """
             color: #666;
             margin-top: 4px;
         }
-        /* 到期预警颜色 */
-        .team-expiry.expiry-normal {
-            color: #52c41a;  /* 绿色 - 超过5天 */
-        }
-        .team-expiry.expiry-warning {
-            color: #fa8c16;  /* 橙色 - 3-5天 */
-        }
-        .team-expiry.expiry-critical {
-            color: #f5222d;  /* 深红色 - 1-2天 */
-        }
-        .team-expiry.expiry-expired {
-            color: #a8071a;  /* 更深的红色 - 已过期 */
-        }
-        /* 整行背景色预警 */
-        .team-item.expiry-normal {
-            border-left: 3px solid #52c41a;
-        }
-        .team-item.expiry-warning {
-            border-left: 3px solid #fa8c16;
-        }
-        .team-item.expiry-critical {
-            border-left: 3px solid #f5222d;
-        }
-        .team-item.expiry-expired {
-            border-left: 3px solid #a8071a;
-            background-color: #fff1f0;
+        .team-workspace {
+            font-size: 11px;
+            color: #667eea;
+            margin-top: 3px;
+            font-weight: 500;
         }
         .team-stats {
             display: grid;
@@ -779,8 +758,9 @@ ADMIN_HTML = """
             const teamItems = [];
             teams.active.forEach(team => teamItems.push({team, statusClass: 'active'}));
             teams.quota_low.forEach(team => teamItems.push({team, statusClass: 'quota-low'}));
-            teams.expired.forEach(team => teamItems.push({team, statusClass: 'expired'}));
-            teams.disabled.forEach(team => teamItems.push({team, statusClass: 'disabled'}));
+            // 隐藏已退出的工作空间: 不追加到前端显示列表
+            // teams.expired.forEach(team => teamItems.push({team, statusClass: 'expired'}));
+            // teams.disabled.forEach(team => teamItems.push({team, statusClass: 'disabled'}));
 
             const currentItems = [];
             const otherItems = [];
@@ -813,36 +793,25 @@ ADMIN_HTML = """
             // Get subscription expiry info
             const subscription = team.subscription;
             let expiryDisplay = '';
-            let expiryClass = '';
             if (subscription && subscription.subscription_active_until) {
                 const expiryDate = new Date(subscription.subscription_active_until);
                 const now = new Date();
                 const daysLeft = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
                 const expiryStr = expiryDate.toLocaleDateString('zh-CN');
                 const daysText = daysLeft > 0 ? `(${daysLeft}天后)` : '(已过期)';
-
-                // 设置到期预警颜色
-                if (daysLeft <= 0) {
-                    expiryClass = 'expiry-expired';  // 已过期 - 红色
-                } else if (daysLeft <= 2) {
-                    expiryClass = 'expiry-critical';  // 1-2天 - 深红色
-                } else if (daysLeft <= 5) {
-                    expiryClass = 'expiry-warning';   // 3-5天 - 橙色
-                } else {
-                    expiryClass = 'expiry-normal';    // 超过5天 - 绿色
-                }
-
-                expiryDisplay = `<div class="team-expiry ${expiryClass}" title="计划类型: ${subscription.plan_type || '-'}">到期: ${expiryStr} ${daysText}</div>`;
+                expiryDisplay = `<div class="team-expiry" title="计划类型: ${subscription.plan_type || '-'}">到期: ${expiryStr} ${daysText}</div>`;
             }
 
             return `
-                <div class="team-item ${statusClass} ${expiryClass}">
+                <div class="team-item ${statusClass}">
                     <div class="team-info">
-                        <div class="team-name">
+                        <div class="team-name" style="display: flex; align-items: center; gap: 6px;">
                             ${team.name}
+                            <button onclick="renameTeam('${team.id}', '${team.name.replace(/'/g, "\\'")}')" title="重命名名称" style="background:none; border:none; cursor:pointer; font-size: 13px; opacity: 0.6; padding: 2px;">✏️</button>
                             ${isCurrent ? '<span class="current-badge">当前</span>' : ''}
                         </div>
                         <div class="team-id">${team.id}</div>
+                        ${team.organization_name ? `<div class="team-workspace">🏢 ${team.organization_name}</div>` : ''}
                         ${expiryDisplay}
                     </div>
                     <div class="team-stats">
@@ -864,10 +833,9 @@ ADMIN_HTML = """
                         <div class="actions">
                             ${isCurrent ? '' : `
                                 ${(statusClass === 'active' || statusClass === 'quota-low') ? `
-                                    <button class="btn btn-primary" onclick="switchToTeam('${team.id}')">切换账号</button>
-                                ` : `
-                                    <button class="btn btn-danger" onclick="deleteTeam('${team.id}')" title="删除团队">删除</button>
-                                `}
+                                    <button class="btn btn-primary" onclick="switchToTeam('${team.id}')" style="margin-right: 5px;">切换账号</button>
+                                ` : ''}
+                                <button class="btn btn-danger" onclick="deleteTeam('${team.id}')" title="删除团队">删除</button>
                             `}
                         </div>
                     </div>
@@ -1017,6 +985,28 @@ ADMIN_HTML = """
             }
         }
 
+        async function renameTeam(teamId, oldName) {
+            const newName = prompt('请输入新的展示名称:', oldName);
+            if (!newName || newName.trim() === '' || newName === oldName) return;
+
+            try {
+                const response = await fetch('/api/rename-team', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({team_id: teamId, new_name: newName.trim()})
+                });
+
+                const result = await response.json();
+                if (result.success) {
+                    refreshData();
+                } else {
+                    alert('重命名失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('请求失败: ' + error);
+            }
+        }
+
         // WebSocket connection for real-time updates
         const socket = io();
 
@@ -1112,6 +1102,32 @@ class AdminInterface:
 
             except Exception as e:
                 self._logger.error("api_switch_error", error=str(e))
+                return jsonify({"success": False, "error": str(e)}), 500
+
+        @self._app.route("/api/rename-team", methods=["POST"])
+        def api_rename_team():
+            """Rename a team display name."""
+            try:
+                data = request.get_json()
+                team_id = data.get("team_id")
+                new_name = data.get("new_name")
+
+                if not team_id or not new_name:
+                    return jsonify({"success": False, "error": "team_id and new_name required"}), 400
+
+                token_manager = getattr(self._app_handler, "_token_manager", None)
+                if not token_manager:
+                    return jsonify({"success": False, "error": "TokenManager not initialized"}), 500
+
+                success = token_manager.update_team_name(team_id, new_name)
+                
+                if success:
+                    return jsonify({"success": True})
+                else:
+                    return jsonify({"success": False, "error": "Team not found or invalid name"})
+
+            except Exception as e:
+                self._logger.error("api_rename_team_error", error=str(e))
                 return jsonify({"success": False, "error": str(e)}), 500
 
         @self._app.route("/api/check", methods=["POST"])
